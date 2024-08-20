@@ -2,16 +2,13 @@ import torch
 import torch.nn as nn
 from torchvision.utils import save_image
 import numpy as np
-import matplotlib
-matplotlib.use('agg')
-import matplotlib.pyplot as plt
 import argparse
 import os
 from itertools import cycle
 from torch.utils.data import DataLoader
-from tensorboardX import SummaryWriter
 from torchvision.utils import save_image
 
+from logger import init_logger
 from vid_process import resize_cropped, resize_keepAR, resize_mnist
 from flags import *
 from networks import Encoder, Decoder
@@ -20,6 +17,8 @@ from covariance_fns import *
 from flags import *
 from setup_priors import *
 from dataloader import *
+
+logger = init_logger(ENCODER_SAVE, osp.join('logs', DATASET))
 
 
 def KL_loss_L1_without_mean(sigma_p_inv, sigma_q, mu_q, det_p, det_q):
@@ -41,6 +40,8 @@ def KL_loss_L1(sigma_p_inv, sigma_q, mu_q, mu_p, det_p, det_q):
     return loss
 
 if (__name__ == '__main__'):
+    logger.info('Starting train.py')
+    logger.info(f'Parameters: {FLAGS}')
 
     # model definition
     encoder = Encoder()
@@ -51,11 +52,11 @@ if (__name__ == '__main__'):
 
     # load saved models if load_saved flag is true
     if LOAD_SAVED:
-        encoder.load_state_dict(torch.load(os.path.join('checkpoints', ENCODER_SAVE)))
-        decoder.load_state_dict(torch.load(os.path.join('checkpoints', DECODER_SAVE)))
+        encoder.load_state_dict(torch.load(os.path.join('outputs', 'checkpoints', DATASET, ENCODER_SAVE)))
+        decoder.load_state_dict(torch.load(os.path.join('outputs', 'checkpoints', DATASET, DECODER_SAVE)))
 
     # loss definition
-    mse_loss = nn.MSELoss()
+    mse_loss = nn.MSELoss(reduction='sum')
 
     # add option to run on gpu
     if (CUDA):
@@ -65,29 +66,26 @@ if (__name__ == '__main__'):
 
     # optimizer
     optimizer = torch.optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), lr = LR, betas=(BETA1, BETA2))
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
 
     if torch.cuda.is_available() and not CUDA:
         print("WARNING: You have a CUDA device, so you should probably run with --cuda")
 
     # creating directories
-    if not os.path.exists('checkpoints'):
-            os.makedirs('checkpoints')
+    if not os.path.exists(osp.join('outputs', 'checkpoints', DATASET)):
+            os.makedirs(osp.join('outputs', 'checkpoints', DATASET))
 
-    if not os.path.exists('reconstructed_images'):
-        os.makedirs('reconstructed_images')
+    if not os.path.exists(osp.join('outputs', 'reconstructed_images', DATASET)):
+        os.makedirs(osp.join('outputs', 'reconstructed_images', DATASET))
 
-    if not os.path.exists('style_transfer_training'):
-        os.makedirs('style_transfer_training')
+    if not os.path.exists(osp.join('outputs', 'style_transfer_training', DATASET)):
+        os.makedirs(osp.join('outputs', 'style_transfer_training', DATASET))
 
     dataset = load_dataset()
     loader = cycle(DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True))
 
-    # initialize summary writer
-    writer = SummaryWriter()
-
     sigma_p_inv, det_p = setup_pz(NUM_FEA, FEA_DIM, FEA)
 
-    # creating copies of encoder-decoder objects for style transfer visualization during training
     encoder_test = Encoder()
     encoder_test.apply(weights_init)
 
@@ -97,35 +95,30 @@ if (__name__ == '__main__'):
     encoder_test.eval()
     decoder_test.eval()
 
-    if (CUDA):
+    if CUDA:
         encoder_test.cuda()
         decoder_test.cuda()
 
     lowest_loss = float('inf')
 
     for epoch in range(START_EPOCH, END_EPOCH):
-        epoch_loss = 0
+        epoch_losses = {'img': 0, 'kl': 0}
+        # epoch_loss = 0
+        # kl_annealing_factor = min(1, epoch / 100)
+        kl_annealing_factor = 1 * BETA
         for iteration in range(len(dataset)//BATCH_SIZE):
-
-            # load a batch of videos
             X_in = next(loader).float().cuda()
-            
-            Y_flat = X_in.view(X_in.size()[0], -1)
-
             optimizer.zero_grad()
 
             X1, KL1, muL1, det_q1 = encoder(X_in)
             dec = decoder(X1)
-
-            # calculate recon loss
-            dec_flat = dec.view(dec.size()[0], -1)
-            img_loss = mse_loss(Y_flat, dec_flat)
-            img_loss.backward(retain_graph = True)
+            img_loss = mse_loss(X_in, dec)
+            epoch_losses['img'] += img_loss.item()
 
             sigma_q1 = torch.einsum('ijkl,ijlm->ijkm', KL1, torch.einsum('ijkl->ijlk', KL1))
 
-            mul1_transpose = torch.transpose(muL1, dim0 = 1, dim1 = 2)
-            if (ZERO_MEAN_FEA):
+            mul1_transpose = torch.transpose(muL1, dim0=1, dim1=2)
+            if ZERO_MEAN_FEA:
                 mu_p_transpose = get_prior_mean(FEA_MEAN_S, FEA_MEAN_E)
                 kl_loss1 = KL_loss_L1(sigma_p_inv, sigma_q1, mul1_transpose, mu_p_transpose, det_p, det_q1)
             else:
@@ -133,60 +126,54 @@ if (__name__ == '__main__'):
 
             # calculate KL divergence
             kl_loss = torch.mean(kl_loss1)
-            kl_loss = kl_loss * BETA
-            kl_loss.backward()
-
+            kl_loss = kl_loss * kl_annealing_factor
             total_loss = img_loss + kl_loss
-            # take a step and update weights of encoder and decoder
+            total_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(decoder.parameters()), max_norm=1.0)
             optimizer.step()
 
             # display losses
-            if (iteration % 200 == 0 and iteration != 0):
-                print('Epoch : ', epoch, ', Iteration : ', iteration, ", Total Loss : ", total_loss.item(),', Image Loss : ', torch.mean(img_loss).item(), ', KL Div. Loss : ', torch.mean(kl_loss).item())
-                epoch_loss += total_loss.item()
-
-        # write to tensorboard
-        writer.add_scalar('Total loss', total_loss.data.storage().tolist()[0], epoch)
-        writer.add_scalar('KL-Divergence loss', kl_loss.data.storage().tolist()[0], epoch)
-        writer.add_scalar('Image loss', img_loss.data.storage().tolist()[0], epoch)
+            # if (iteration % 200 == 0 and iteration != 0):
+                # print('Epoch : ', epoch, ', Iteration : ', iteration, ", Total Loss : ", total_loss.item(),', Image Loss : ', torch.mean(img_loss).item(), ', KL Div. Loss : ', torch.mean(kl_loss).item())
+                # print(f'Epoch: {epoch}, Iteration: {iteration}, Total loss: {total_loss.item()}, Image loss: {torch.mean(img_loss).item()}, KL Div. loss: {torch.mean(kl_loss).item()}({kl_annealing_factor})')
+                # epoch_loss += total_loss.item()
+            epoch_losses['kl'] += kl_loss1.sum().item()
+        epoch_losses['img'] = epoch_losses['img'] / len(dataset)
+        epoch_losses['kl'] = epoch_losses['kl'] / len(dataset)
+        epoch_losses['total'] = epoch_losses['img'] + epoch_losses['kl']
+        logger.info(f'Epoch: {epoch}, Total loss: {epoch_losses["total"]}, Image loss: {epoch_losses["img"]}, KL Div. loss: {epoch_losses["kl"]}(AF: {kl_annealing_factor})')
+        scheduler.step()
 
         # retrieving another batch to reconstruct for saving reconstructed images
         X_in = next(loader).float().cuda()
-        
-        # saving reconstructed images
         original_sample = X_in.cpu()[0, :, :, :, :]
-        enc, KL1, muL1, det_q1 = encoder(X_in)
-        dec = decoder(enc)
-        decoded_sample = (dec).detach().cpu()[0, :, :, :, :]
-        if (DATASET == 'moving_mnist'):
-            original_sample = original_sample.transpose(-1, -2)
-            decoded_sample = decoded_sample.transpose(-1, -2)
-        
-        save_image(original_sample, OUTPUT_PATH + '/epoch={}_original.png'.format(str(epoch)), nrow=NUM_FRAMES, normalize=True)
-        save_image(decoded_sample, OUTPUT_PATH + '/epoch={}_recon.png'.format(str(epoch)), nrow=NUM_FRAMES, normalize=True)
+        with torch.no_grad():
+            enc, KL1, muL1, det_q1 = encoder(X_in)
+            dec = decoder(enc)
+            decoded_sample = dec.detach().cpu()[0, :, :, :, :]
 
-        epoch_loss /= 3
-        if epoch_loss < lowest_loss:
-            
-            lowest_loss = epoch_loss
-           
-            # save checkpoints
-            torch.save(encoder.state_dict(), os.path.join('checkpoints', ENCODER_SAVE))
-            torch.save(decoder.state_dict(), os.path.join('checkpoints', DECODER_SAVE))
-            print('Model Saved! Epoch loss at {}'.format(lowest_loss))
+        save_image(original_sample, OUTPUT_PATH + f'/{epoch}_{ENCODER_SAVE}_org.png', nrow=NUM_FRAMES, normalize=True)
+        save_image(decoded_sample, OUTPUT_PATH + f'/{epoch}_{ENCODER_SAVE}_rec.png', nrow=NUM_FRAMES, normalize=True)
 
-            encoder_test.load_state_dict(torch.load(os.path.join('checkpoints', ENCODER_SAVE)))
-            decoder_test.load_state_dict(torch.load(os.path.join('checkpoints', DECODER_SAVE)))
+        if epoch_losses['total'] < lowest_loss:
+            lowest_loss = epoch_losses['total']
+            torch.save(encoder.state_dict(), os.path.join('outputs', 'checkpoints', DATASET, ENCODER_SAVE))
+            torch.save(decoder.state_dict(), os.path.join('outputs', 'checkpoints', DATASET, DECODER_SAVE))
+            logger.info('Model Saved! Epoch loss at {}'.format(lowest_loss))
+
+            encoder_test.load_state_dict(torch.load(os.path.join('outputs', 'checkpoints', DATASET, ENCODER_SAVE)))
+            decoder_test.load_state_dict(torch.load(os.path.join('outputs', 'checkpoints', DATASET, DECODER_SAVE)))
 
             video1 = next(loader).float().cuda()[0].unsqueeze(0)
             video2 = next(loader).float().cuda()[0].unsqueeze(0)
 
-            X1_v1, KL1_v1, muL1_v1, det_q1_v1 = encoder_test(video1, BATCH_SIZE=1)
-            dec_v1 = decoder_test(X1_v1, BATCH_SIZE=1)
-            
-            X1_v2, KL1_v2, muL1_v2, det_q1_v2 = encoder_test(video2, BATCH_SIZE=1)
-            dec_v2 = decoder_test(X1_v2, BATCH_SIZE=1)
-             
-            # visualize style transfer
+            with torch.no_grad():
+                X1_v1, KL1_v1, muL1_v1, det_q1_v1 = encoder_test(video1, BATCH_SIZE=1)
+                dec_v1 = decoder_test(X1_v1, BATCH_SIZE=1)
+
+                X1_v2, KL1_v2, muL1_v2, det_q1_v2 = encoder_test(video2, BATCH_SIZE=1)
+                dec_v2 = decoder_test(X1_v2, BATCH_SIZE=1)
+
             plot_training_images(video1, video2, dec_v1, dec_v2, X1_v1, X1_v2, epoch, decoder_test)
 
